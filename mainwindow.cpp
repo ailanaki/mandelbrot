@@ -53,10 +53,14 @@ MainWindow::MainWindow(QWidget *parent)
         : QMainWindow(parent)
         , ui(new Ui::MainWindow)
 {
+    setMinimumSize(32, 32);
+
     connect(
-            this, &MainWindow::blockReady, this, [this]() {
-                if (++blockCount == buf_size.height())
+            this, &MainWindow::blockReady, this, [this](int cookie) {
+                if (cookie == blockCookie && ++blockCount == buf_size.height()) {
+                    updateMipmap();
                     repaint();
+                }
             },
             Qt::QueuedConnection);
     ui->setupUi(this);
@@ -65,12 +69,15 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {}
 
-QSize MainWindow::minimumSizeHint() const {
-    return QSize(1, 1);
-}
 
 QSize MainWindow::sizeHint() const{
     return {640, 480};
+}
+
+void MainWindow::updateMipmap() {
+    mipmap = makeImage().scaled(mipmap_size, mipmap_size, Qt::IgnoreAspectRatio);
+    mipmap_upper_left = upper_left;
+    mipmap_lower_right = lower_right;
 }
 
 void MainWindow::paintEvent(QPaintEvent *){
@@ -78,20 +85,16 @@ void MainWindow::paintEvent(QPaintEvent *){
     if (is_drag || !isImageReady()) {
         auto ul = pt2pix(rect(), mipmap_upper_left, upper_left, lower_right);
         auto lr = pt2pix(rect(), mipmap_lower_right, upper_left, lower_right);
+
         painter.drawImage(QRect{ul, lr}, mipmap);
-    } else if (isImageReady()) {
+    } else  {
         painter.drawImage(0, 0, makeImage());
-        if (needUpdateMipmap) {
-            needUpdateMipmap = false;
-            mipmap_upper_left = upper_left;
-            mipmap_lower_right = lower_right;
-            mipmap = makeImage().scaled(mipmap_size, mipmap_size, Qt::KeepAspectRatio);
-        }
     }
 }
 
 
 void MainWindow::resizeEvent(QResizeEvent *){
+    lower_right = pix2pt(buf_size, {width(), height()}, upper_left, lower_right);
     renderMandelbrot();
 }
 
@@ -105,25 +108,31 @@ void MainWindow::wheelEvent(QWheelEvent *event){
     upper_left = center - half;
     lower_right = center + half;
     renderMandelbrot();
-    update();
 }
 
 void MainWindow::mouseMoveEvent(QMouseEvent *event){
     if (is_drag) {
         auto size = lower_right - upper_left;
-        auto old_pos = pix2pt(this->size(), drag_start_pos, upper_left, lower_right);
+        auto old_pos = pix2pt(this->size(), drag_curr_pos, upper_left, lower_right);
         auto new_pos = pix2pt(this->size(), event->pos(), upper_left, lower_right);
 
-        drag_start_pos = event->pos();
+        drag_curr_pos = event->pos();
         upper_left += old_pos - new_pos;
         lower_right = upper_left + size;
-        repaint();
+        auto ss = drag_start_pos - event->pos();
+        if (abs(ss.x()) > (width() >> 3) ||
+            abs(ss.y()) > (height() >> 3)) {
+            drag_start_pos = drag_curr_pos;
+            renderMandelbrot();
+        }
+        update();
     }
 }
 
 void MainWindow::mousePressEvent(QMouseEvent *event) {
     is_drag = true;
     drag_start_pos = event->pos();
+    drag_curr_pos = drag_start_pos;
 }
 
 void MainWindow::mouseReleaseEvent(QMouseEvent *){
@@ -140,24 +149,29 @@ void MainWindow::renderMandelbrot() {
         bytesPerLine = static_cast<int>(pow(2., ceil(log2(buf_size.width()))));
         buf = {static_cast<uchar *>(aligned_alloc(32, bytesPerLine * buf_size.height())), &free};
     }
-    memset(buf.get(), 0, bytesPerLine * buf_size.height());
+
     blockCount = 0;
-    needUpdateMipmap = true;
+    auto cookie = ++blockCookie;
+    auto ul = upper_left;
+    auto lr = lower_right;
+    memset(buf.get(), 0, bytesPerLine * buf_size.height());
     for (int row = 0; row < buf_size.height(); ++row) {
         auto scanLine = row * bytesPerLine;
         QThreadPool::globalInstance()->start(
-                [this, row, scanLine]() {
+                [this, row, scanLine, cookie, ul, lr]() {
                     for (int column = 0; column < buf_size.width(); ++column) {
-                        auto point = pix2pt(buf_size, {column, row}, upper_left, lower_right);
-                        if (auto count = infinity_step(point, max_iter); count != -1) {
-                            auto idx = 255. * (count) / max_iter;
+                        auto point = pix2pt(buf_size, {column, row}, ul, lr);
+                        if (auto count = infinity_step(point, max_iter); count!= -1) {
+                            auto idx = 255. * count / max_iter;
                             (buf.get())[scanLine + column] = 255 - static_cast<int>(idx) % 256;
                         }
                     }
-                    emit blockReady();
+                    emit blockReady(cookie);
                 });
     }
 }
+
+
 QImage MainWindow::makeImage() const {
     return QImage(buf.get(),
                   buf_size.width(),
